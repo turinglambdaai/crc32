@@ -31,7 +31,7 @@ SOFTWARE.
 
 (require racket/require
          racket/performance-hint
-         (only-in racket/fixnum fxvector)
+         (only-in racket/fixnum fxvector make-fxvector)
          (only-in racket/bytes bytes-append*)
          (only-in racket/list make-list)
          (for-syntax racket/base)
@@ -116,6 +116,26 @@ SOFTWARE.
                         #xB3667A2E #xC4614AB8 #x5D681B02 #x2A6F2B94
                         #xB40BBE37 #xC30C8EA1 #x5A05DF1B #x2D02EF8D))
 
+;; Slicing-by-8 tables: T_k[i] applies the base-table shift k more times,
+;; so eight input bytes are folded with eight table lookups instead of
+;; eight sequential single-byte updates.
+(define (make-slicing-table prev)
+  (define t (make-fxvector 256 0))
+  (for ([n (in-range 256)])
+    (define c (fxvector-ref prev n))
+    (fxvector-set! t n
+                   (fxxor (fxvector-ref table (fxand c #xFF))
+                          (fxrshift c 8))))
+  t)
+
+(define table1 (make-slicing-table table))
+(define table2 (make-slicing-table table1))
+(define table3 (make-slicing-table table2))
+(define table4 (make-slicing-table table3))
+(define table5 (make-slicing-table table4))
+(define table6 (make-slicing-table table5))
+(define table7 (make-slicing-table table6))
+
 ;; Initial CRC32 value (all bits set)
 (define crc32-initial-value #xFFFFFFFF)
 
@@ -128,12 +148,45 @@ SOFTWARE.
 (define-inline (crc32-finalize acc)
   (fxxor acc #xFFFFFFFF))
 
+;; Fold bs[start, end) into acc: slicing-by-8 blocks plus a byte tail.
+;; Returns the raw accumulator (finalize separately).
+(define (crc32-fold-range acc bs start end)
+  (let loop ([i start] [acc acc])
+    (cond
+      [(fx<= (fx+ i 8) end)
+       (let* ([b0 (bytes-ref bs i)]
+              [b1 (bytes-ref bs (fx+ i 1))]
+              [b2 (bytes-ref bs (fx+ i 2))]
+              [b3 (bytes-ref bs (fx+ i 3))]
+              [b4 (bytes-ref bs (fx+ i 4))]
+              [b5 (bytes-ref bs (fx+ i 5))]
+              [b6 (bytes-ref bs (fx+ i 6))]
+              [b7 (bytes-ref bs (fx+ i 7))]
+              [one (fxxor acc b0
+                          (fxlshift b1 8)
+                          (fxlshift b2 16)
+                          (fxlshift b3 24))]
+              [two (fxxor b4
+                          (fxlshift b5 8)
+                          (fxlshift b6 16)
+                          (fxlshift b7 24))])
+         (loop (fx+ i 8)
+               (fxxor
+                (fxvector-ref table7 (fxand one #xFF))
+                (fxvector-ref table6 (fxand (fxrshift one 8) #xFF))
+                (fxvector-ref table5 (fxand (fxrshift one 16) #xFF))
+                (fxvector-ref table4 (fxrshift one 24))
+                (fxvector-ref table3 (fxand two #xFF))
+                (fxvector-ref table2 (fxand (fxrshift two 8) #xFF))
+                (fxvector-ref table1 (fxand (fxrshift two 16) #xFF))
+                (fxvector-ref table  (fxrshift two 24)))))]
+      [(fx< i end)
+       (loop (fx+ i 1) (crc32-update acc (bytes-ref bs i)))]
+      [else acc])))
+
 ;; Compute CRC32 of a byte string
 (define (crc32-bytes bs)
-  (for/fold ([acc crc32-initial-value]
-             #:result (crc32-finalize acc))
-            ([byte (in-bytes bs)])
-    (crc32-update acc byte)))
+  (crc32-finalize (crc32-fold-range crc32-initial-value bs 0 (bytes-length bs))))
 
 ;; Compute CRC32 of a UTF-8 encoded string
 (define (crc32-string/utf8 s)
@@ -147,12 +200,15 @@ SOFTWARE.
 (define (crc32-string/locale s)
   (crc32-bytes (string->bytes/locale s)))
 
-;; Compute CRC32 from input port
+;; Compute CRC32 from input port, reading 64KB chunks instead of one byte
+;; at a time so the slicing kernel dominates the runtime
 (define (crc32-input-port [in (current-input-port)])
-  (for/fold ([acc crc32-initial-value]
-             #:result (crc32-finalize acc))
-            ([byte (in-input-port-bytes in)])
-    (crc32-update acc byte)))
+  (define buf (make-bytes 65536))
+  (let loop ([acc crc32-initial-value])
+    (define n (read-bytes-avail! buf in))
+    (if (and (exact-integer? n) (fx> n 0))
+        (loop (crc32-fold-range acc buf 0 n))
+        (crc32-finalize acc))))
 
 ;;;=======================
 ;;;    Comprehensive Test Suite
@@ -206,6 +262,7 @@ SOFTWARE.
     '((#"" . #x00000000)
       (#"a" . #xE8B7BE43)
       (#"abc" . #x352441C2)
+      (#"123456789" . #xCBF43926) ; canonical CRC-32 check value
       (#"message digest" . #x20159D7F)
       (#"abcdefghijklmnopqrstuvwxyz" . #x4C2750BD)
       (#"The quick brown fox jumps over the lazy dog" . #x414FA339)))
@@ -308,6 +365,12 @@ SOFTWARE.
       (test-crc32-proc input-bytes-test standard-test-cases)
       (test-crc32-proc input-string-test ascii-string-test-cases)
       (test-crc32-proc input-string-test utf8-string-test-cases)))
+
+  (test-case "Input port reads cross chunk boundaries"
+    ;; ~3x the 64KB internal buffer so several chunked reads must agree
+    (define big (list->bytes (for/list ([i 200000]) (modulo i 251))))
+    (check-equal? (crc32-input-port (open-input-bytes big))
+                  (crc32-bytes big)))
 
   ;; Additional consistency validation tests
   (test-case "Function consistency validation"
